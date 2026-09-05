@@ -1,4 +1,18 @@
 #!/usr/bin/env node
+/**
+ * PV Guard — Forwarder (Render / nuvem / local)
+ *
+ * Busca o status das plantas no WEG PV Cloud (com assinatura WASM) e envia pro app.
+ * Roda em loop a cada 5 minutos (ou INTERVAL_MS). Não precisa de dependências — só Node 18+.
+ *
+ * Variáveis de ambiente:
+ *   WEG_USER      = seu usuário do portal WEG PV Cloud
+ *   WEG_PASS      = sua senha do portal
+ *   APP_URL       = https://quaint-pv-guard-sync.base44.app/functions/receiveWegStatus
+ *   APP_SECRET    = o segredo mostrado na tela de Configurações do app
+ *   INTERVAL_MS   = (opcional) padrão 300000 = 5 minutos
+ */
+
 const crypto = require("node:crypto");
 const md5 = (s) => crypto.createHash("md5").update(s, "utf8").digest("hex");
 
@@ -14,6 +28,7 @@ if (!WEG_USER || !WEG_PASS || !APP_URL || !APP_SECRET) {
   process.exit(1);
 }
 
+// --- Carrega o módulo WASM de assinatura do portal v2 ---
 let _e = null, _mem = null;
 const _enc = new TextEncoder(), _dec = new TextDecoder();
 async function ensureWasm() {
@@ -88,6 +103,28 @@ async function workMode(token, plantId) {
   } catch { return null; }
 }
 
+// Busca o SOC da bateria. O device/overview lista os dispositivos (com id + category), mas o
+// soc.value vem vazio. O SOC real é obtido chamando device/detail por bateria com seu id.
+async function batterySoc(token, plantId) {
+  try {
+    const data = await wegRequest("POST", "/dew/w/plant/device/overview", token, { plantID: plantId });
+    if (data?.errno && data.errno !== 0) return null;
+    const devices = data?.result?.data ?? [];
+    const batteries = devices.filter((d) => d.category === "battery" || /battery/i.test(d.categoryStr || ""));
+    if (!batteries.length) return null;
+    const socs = [];
+    for (const b of batteries) {
+      try {
+        const detail = await wegRequest("GET", "/dew/v0/device/detail", token, undefined, { id: b.id, category: "battery" });
+        const soc = parseFloat(detail?.result?.battery?.soc);
+        if (!isNaN(soc) && soc >= 0) socs.push(soc);
+      } catch { /* pula bateria individual */ }
+    }
+    if (!socs.length) return null;
+    return Math.round(socs.reduce((a, b) => a + b, 0) / socs.length);
+  } catch { return null; }
+}
+
 function statusFromPlant(plant, mode) {
   const wm = String(mode?.workMode || "").toLowerCase();
   if (/(backup|offgrid|off_grid|off-grid|eps|island|bess)/.test(wm)) return "bess";
@@ -97,6 +134,34 @@ function statusFromPlant(plant, mode) {
   return "on_grid";
 }
 
+// --- Probe: testa endpoints candidatos para encontrar o que retorna batSoc ---
+async function probeEndpoints(token, plantId) {
+  const candidates = [
+    { method: "GET",  path: "/dew/w/plant/data/realtime", query: { plantID: plantId } },
+    { method: "GET",  path: "/dew/w/plant/realtime",      query: { plantID: plantId } },
+    { method: "GET",  path: "/dew/w/plant/overview",      query: { plantID: plantId } },
+    { method: "GET",  path: "/dew/w/plant/detail",        query: { plantID: plantId } },
+    { method: "GET",  path: "/dew/w/plant/info",          query: { plantID: plantId } },
+    { method: "GET",  path: "/dew/w/v0/plant/data",       query: { plantID: plantId } },
+    { method: "POST", path: "/dew/w/v0/plant/data/realtime", body: { plantID: plantId } },
+    { method: "POST", path: "/dew/w/v0/plant/realtime",     body: { plantID: plantId } },
+    { method: "POST", path: "/dew/w/v0/plant/overview",     body: { plantID: plantId } },
+    { method: "POST", path: "/dew/w/v0/plant/detail",       body: { plantID: plantId } },
+    { method: "POST", path: "/dew/w/plant/data",            body: { plantID: plantId } },
+  ];
+  console.log("\n========== PROBE DE ENDPOINTS (plantID=" + plantId + ") ==========");
+  for (const c of candidates) {
+    try {
+      const data = await wegRequest(c.method, c.path, token, c.body, c.query);
+      const has = data && JSON.stringify(data).toLowerCase().includes("batsoc");
+      console.log(`[${has ? "★★★ BATSOC!" : "  no batSoc"}] ${c.method} ${c.path} →`, JSON.stringify(data).slice(0, 600));
+    } catch (e) {
+      console.log(`[   erro    ] ${c.method} ${c.path} → ${e.message}`);
+    }
+  }
+  console.log("========== FIM DO PROBE ==========\n");
+}
+
 async function tick() {
   try {
     console.log(`[${new Date().toISOString()}] Sincronizando...`);
@@ -104,17 +169,22 @@ async function tick() {
     const token = await login();
     const plants = await plantList(token);
     const payload = [];
-    for (const p of plants) {
-      const pid = p.plantId ?? p.id ?? p.plant_id;
-      const name = p.plantName ?? p.name ?? ("Planta " + pid);
+    for (let i = 0; i < plants.length; i++) {
+      const p = plants[i];
+      if (i === 0) console.log("Chaves da planta:", Object.keys(p).join(", "), "| primeira planta:", JSON.stringify(p).slice(0, 500));
+      const pid = p.plantID ?? p.plantId ?? p.id ?? p.plant_id ?? p.uuid ?? p.oid ?? p.stationId ?? p.stationID ?? null;
+      const name = p.plantName ?? p.name ?? p.stationName ?? ("Planta " + (pid || i));
       const mode = await workMode(token, pid);
+      const soc = await batterySoc(token, pid);
       payload.push({
         weg_plant_id: pid,
         name,
         status: statusFromPlant(p, mode),
-        summary: JSON.stringify({ plant: p, mode }).slice(0, 2000),
+        soc_bateria: soc,
+        summary: JSON.stringify({ plant: p, mode, soc }).slice(0, 2000),
       });
     }
+
     const res = await fetch(APP_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -128,6 +198,20 @@ async function tick() {
   }
 }
 
-tick();
-setInterval(tick, INTERVAL_MS);
+// Roda o probe uma vez no startup, depois entra no loop normal.
+(async () => {
+  try {
+    await ensureWasm();
+    const token = await login();
+    const plants = await plantList(token);
+    const first = plants[0];
+    const pid = first?.plantID ?? first?.plantId ?? first?.id ?? first?.plant_id ?? first?.uuid ?? first?.oid ?? first?.stationId ?? first?.stationID;
+    if (pid) await probeEndpoints(token, pid);
+    else console.log("Probe: nenhuma planta encontrada para testar endpoints.");
+  } catch (e) {
+    console.error("Probe falhou:", e.message);
+  }
+  tick();
+  setInterval(tick, INTERVAL_MS);
+})();
 console.log(`Forwarder PV Guard rodando a cada ${INTERVAL_MS / 1000}s. Ctrl+C para parar.`);
