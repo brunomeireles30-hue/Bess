@@ -20,7 +20,7 @@ const WEG_USER = process.env.WEG_USER;
 const WEG_PASS = process.env.WEG_PASS;
 const APP_URL = process.env.APP_URL;
 const APP_SECRET = process.env.APP_SECRET;
-const INTERVAL_MS = Number(process.env.INTERVAL_MS || 300000);
+const INTERVAL_MS = Number(process.env.INTERVAL_MS || 120000);
 const WEG_BASE = "https://weg.pv-hub.cloud";
 
 if (!WEG_USER || !WEG_PASS || !APP_URL || !APP_SECRET) {
@@ -127,10 +127,11 @@ async function batterySoc(token, plantId) {
 
 function statusFromPlant(plant, mode) {
   const wm = String(mode?.workMode || "").toLowerCase();
-  if (/(backup|offgrid|off_grid|off-grid|eps|island|bess)/.test(wm)) return "bess";
+  // workMode é a CONFIGURAÇÃO do inversor, não o estado atual:
+  //   "Backup", "Self-Use", "Feed-in-First" → on_grid (conectado à rede)
+  //   "Off-Grid" / "Island" / "EPS" → bess (operando na bateria)
+  if (/(offgrid|off_grid|off-grid|eps|island)/.test(wm)) return "bess";
   if (wm) return "on_grid";
-  const blob = JSON.stringify(plant).toLowerCase();
-  if (/(offgrid|off-grid|off_grid|eps|island)/.test(blob)) return "bess";
   return "on_grid";
 }
 
