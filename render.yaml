@@ -1,0 +1,18 @@
+services:
+  - type: worker
+    name: pv-guard-forwarder
+    runtime: node
+    plan: free
+    buildCommand: "true"
+    startCommand: "node weg-forwarder.js"
+    envVars:
+      - key: WEG_USER
+        sync: false
+      - key: WEG_PASS
+        sync: false
+      - key: APP_URL
+        value: https://quaint-pv-guard-sync.base44.app/functions/receiveWegStatus
+      - key: APP_SECRET
+        sync: false
+      - key: INTERVAL_MS
+        value: "300000"

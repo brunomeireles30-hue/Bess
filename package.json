@@ -1,0 +1,13 @@
+{
+  "name": "pv-guard-forwarder",
+  "version": "1.0.0",
+  "description": "Forwarder local do PV Guard",
+  "main": "weg-forwarder.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node weg-forwarder.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
